@@ -16,6 +16,7 @@ services:
     volumes:
       - ./config/config.json:/home/picoclaw/.picoclaw/config.json:ro
       - picoclaw-workspace:/home/picoclaw/.picoclaw/workspace
+      - /home/schubert/Desenvolvimento:/home/picoclaw/.picoclaw/workspace/projects
     entrypoint: ["picoclaw", "agent"]
     stdin_open: true
     tty: true
@@ -40,6 +41,8 @@ services:
       - ./config/config.json:/home/picoclaw/.picoclaw/config.json:ro
       # Persistent workspace (sessions, memory, logs)
       - picoclaw-workspace:/home/picoclaw/.picoclaw/workspace
+      # Host projects (read-write)
+      - /home/schubert/Desenvolvimento:/home/picoclaw/.picoclaw/workspace/projects
     command: ["gateway"]
 
 volumes:
