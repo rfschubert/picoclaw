@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mymmrac/telego"
 	"github.com/mymmrac/telego/telegohandler"
@@ -21,6 +22,11 @@ import (
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/utils"
 	"github.com/sipeed/picoclaw/pkg/voice"
+)
+
+const (
+	telegramMaxMessageLen  = 4096
+	telegramSafeContentLen = 3000
 )
 
 type TelegramChannel struct {
@@ -164,32 +170,33 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 		c.stopThinking.Delete(msg.ChatID)
 	}
 
-	htmlContent := markdownToTelegramHTML(msg.Content)
+	// Split raw markdown BEFORE HTML conversion (SplitMessage understands markdown code blocks)
+	chunks := utils.SplitMessage(msg.Content, telegramSafeContentLen)
+	if len(chunks) == 0 {
+		return nil
+	}
 
-	// Try to edit placeholder
-	if pID, ok := c.placeholders.Load(msg.ChatID); ok {
-		c.placeholders.Delete(msg.ChatID)
-		editMsg := tu.EditMessageText(tu.ID(chatID), pID.(int), htmlContent)
-		editMsg.ParseMode = telego.ModeHTML
+	for i, chunk := range chunks {
+		htmlContent := markdownToTelegramHTML(chunk)
 
-		if _, err = c.bot.EditMessageText(ctx, editMsg); err == nil {
-			return nil
+		// First chunk: try to edit the "Thinking..." placeholder
+		if i == 0 {
+			if pID, ok := c.placeholders.Load(msg.ChatID); ok {
+				c.placeholders.Delete(msg.ChatID)
+				safeHTML := utf8SafeTruncate(htmlContent, telegramMaxMessageLen)
+				editMsg := tu.EditMessageText(tu.ID(chatID), pID.(int), safeHTML)
+				editMsg.ParseMode = telego.ModeHTML
+				if _, editErr := c.bot.EditMessageText(ctx, editMsg); editErr == nil {
+					continue
+				}
+				// Edit failed — fall through to send as new message
+			}
 		}
-		// Fallback to new message if edit fails
+
+		if err := c.sendHTMLChunk(ctx, chatID, htmlContent); err != nil {
+			return fmt.Errorf("failed to send chunk %d/%d: %w", i+1, len(chunks), err)
+		}
 	}
-
-	tgMsg := tu.Message(tu.ID(chatID), htmlContent)
-	tgMsg.ParseMode = telego.ModeHTML
-
-	if _, err = c.bot.SendMessage(ctx, tgMsg); err != nil {
-		logger.ErrorCF("telegram", "HTML parse failed, falling back to plain text", map[string]any{
-			"error": err.Error(),
-		})
-		tgMsg.ParseMode = ""
-		_, err = c.bot.SendMessage(ctx, tgMsg)
-		return err
-	}
-
 	return nil
 }
 
@@ -519,6 +526,29 @@ func extractInlineCodes(text string) inlineCodeMatch {
 	})
 
 	return inlineCodeMatch{text: text, codes: codes}
+}
+
+func utf8SafeTruncate(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes])
+}
+
+func (c *TelegramChannel) sendHTMLChunk(ctx context.Context, chatID int64, htmlContent string) error {
+	htmlContent = utf8SafeTruncate(htmlContent, telegramMaxMessageLen)
+	tgMsg := tu.Message(tu.ID(chatID), htmlContent)
+	tgMsg.ParseMode = telego.ModeHTML
+	if _, err := c.bot.SendMessage(ctx, tgMsg); err != nil {
+		logger.ErrorCF("telegram", "HTML parse failed, falling back to plain text", map[string]any{
+			"error": err.Error(),
+		})
+		tgMsg.ParseMode = ""
+		_, plainErr := c.bot.SendMessage(ctx, tgMsg)
+		return plainErr
+	}
+	return nil
 }
 
 func escapeHTML(text string) string {

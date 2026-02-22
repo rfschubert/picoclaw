@@ -44,3 +44,5 @@ tasks/
 
 # Added by goreleaser init:
 dist/
+Dockerfile.local
+docker-compose.override.yml
