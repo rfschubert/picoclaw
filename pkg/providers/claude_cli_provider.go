@@ -31,11 +31,12 @@ func (p *ClaudeCliProvider) Chat(
 	prompt := p.messagesToPrompt(messages)
 
 	args := []string{"-p", "--output-format", "json", "--dangerously-skip-permissions", "--no-chrome"}
+	// Don't pass --model for claude-cli as it's not a valid model name
+	if model != "" && model != "claude-code" && model != "claude-cli" {
+		args = append(args, "--model", model)
+	}
 	if systemPrompt != "" {
 		args = append(args, "--system-prompt", systemPrompt)
-	}
-	if model != "" && model != "claude-code" {
-		args = append(args, "--model", model)
 	}
 	args = append(args, "-") // read from stdin
 

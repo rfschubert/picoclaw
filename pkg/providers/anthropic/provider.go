@@ -110,15 +110,24 @@ func buildParams(
 	var system []anthropic.TextBlockParam
 	var anthropicMessages []anthropic.MessageParam
 
-	for _, msg := range messages {
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
 		switch msg.Role {
 		case "system":
 			system = append(system, anthropic.TextBlockParam{Text: msg.Content})
 		case "user":
 			if msg.ToolCallID != "" {
+				// Collect all consecutive tool results into a single user message
+				var toolResultBlocks []anthropic.ContentBlockParamUnion
+				toolResultBlocks = append(toolResultBlocks,
+					anthropic.NewToolResultBlock(msg.ToolCallID, msg.Content, false))
+				for i+1 < len(messages) && (messages[i+1].Role == "tool" || (messages[i+1].Role == "user" && messages[i+1].ToolCallID != "")) {
+					i++
+					toolResultBlocks = append(toolResultBlocks,
+						anthropic.NewToolResultBlock(messages[i].ToolCallID, messages[i].Content, false))
+				}
 				anthropicMessages = append(anthropicMessages,
-					anthropic.NewUserMessage(anthropic.NewToolResultBlock(msg.ToolCallID, msg.Content, false)),
-				)
+					anthropic.NewUserMessage(toolResultBlocks...))
 			} else {
 				anthropicMessages = append(anthropicMessages,
 					anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content)),
@@ -140,9 +149,17 @@ func buildParams(
 				)
 			}
 		case "tool":
+			// Collect all consecutive tool results into a single user message
+			var toolResultBlocks []anthropic.ContentBlockParamUnion
+			toolResultBlocks = append(toolResultBlocks,
+				anthropic.NewToolResultBlock(msg.ToolCallID, msg.Content, false))
+			for i+1 < len(messages) && messages[i+1].Role == "tool" {
+				i++
+				toolResultBlocks = append(toolResultBlocks,
+					anthropic.NewToolResultBlock(messages[i].ToolCallID, messages[i].Content, false))
+			}
 			anthropicMessages = append(anthropicMessages,
-				anthropic.NewUserMessage(anthropic.NewToolResultBlock(msg.ToolCallID, msg.Content, false)),
-			)
+				anthropic.NewUserMessage(toolResultBlocks...))
 		}
 	}
 
