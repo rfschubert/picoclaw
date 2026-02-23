@@ -38,6 +38,7 @@ type AgentLoop struct {
 	summarizing    sync.Map
 	fallback       *providers.FallbackChain
 	channelManager *channels.Manager
+	startTime      time.Time
 }
 
 // processOptions configures how a message is processed
@@ -76,6 +77,7 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 		state:       stateManager,
 		summarizing: sync.Map{},
 		fallback:    fallbackChain,
+		startTime:   time.Now(),
 	}
 }
 
@@ -318,6 +320,11 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			"session_key": sessionKey,
 			"matched_by":  route.MatchedBy,
 		})
+
+	// Check for maintenance commands (bypass LLM)
+	if response, handled := al.handleMaintenanceCommand(ctx, msg, agent, sessionKey); handled {
+		return response, nil
+	}
 
 	return al.runAgentLoop(ctx, agent, processOptions{
 		SessionKey:      sessionKey,
@@ -769,6 +776,7 @@ func (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey, channel, c
 
 // forceCompression aggressively reduces context when the limit is hit.
 // It drops the oldest 50% of messages (keeping system prompt and last user message).
+// It respects tool call boundaries to avoid splitting assistant+tool_result groups.
 func (al *AgentLoop) forceCompression(agent *AgentInstance, sessionKey string) {
 	history := agent.Sessions.GetHistory(sessionKey)
 	if len(history) <= 4 {
@@ -783,13 +791,15 @@ func (al *AgentLoop) forceCompression(agent *AgentInstance, sessionKey string) {
 		return
 	}
 
-	// Helper to find the mid-point of the conversation
+	// Find the midpoint, then adjust forward to avoid splitting a tool call turn.
+	// A valid cut point is NOT in the middle of an assistant+tool_result group.
 	mid := len(conversation) / 2
-
-	// New history structure:
-	// 1. System Prompt (with compression note appended)
-	// 2. Second half of conversation
-	// 3. Last message
+	for mid < len(conversation) && conversation[mid].Role == "tool" {
+		mid++ // Skip past tool results to land after the complete turn
+	}
+	if mid >= len(conversation) {
+		mid = len(conversation) / 2 // Fallback if everything is tool messages
+	}
 
 	droppedCount := mid
 	keptConversation := conversation[mid:]
@@ -1026,6 +1036,128 @@ func (al *AgentLoop) estimateTokens(messages []providers.Message) int {
 	}
 	// 2.5 chars per token = totalChars * 2 / 5
 	return totalChars * 2 / 5
+}
+
+// handleMaintenanceCommand handles maintenance slash commands that bypass the LLM.
+// These commands require an agent and session context (resolved by routing) but do not
+// invoke the LLM, making them safe for remote recovery even when the LLM is unavailable.
+func (al *AgentLoop) handleMaintenanceCommand(
+	ctx context.Context,
+	msg bus.InboundMessage,
+	agent *AgentInstance,
+	sessionKey string,
+) (string, bool) {
+	content := strings.TrimSpace(msg.Content)
+	if !strings.HasPrefix(content, "/") {
+		return "", false
+	}
+
+	fields := strings.Fields(content)
+	if len(fields) == 0 {
+		return "", false
+	}
+	cmd := fields[0]
+
+	switch cmd {
+	case "/new":
+		agent.Sessions.TruncateHistory(sessionKey, 0)
+		agent.Sessions.SetSummary(sessionKey, "")
+		agent.Sessions.Save(sessionKey)
+		return "Session cleared. Fresh start!", true
+
+	case "/recovery":
+		history := agent.Sessions.GetHistory(sessionKey)
+		msgCount := len(history)
+		summary := agent.Sessions.GetSummary(sessionKey)
+
+		// Count orphaned tool calls (tool messages without a preceding assistant tool call)
+		orphanedTools := 0
+		for i, m := range history {
+			if m.Role == "tool" {
+				hasParent := false
+				for j := i - 1; j >= 0; j-- {
+					if history[j].Role == "tool" {
+						continue
+					}
+					if history[j].Role == "assistant" && len(history[j].ToolCalls) > 0 {
+						hasParent = true
+					}
+					break
+				}
+				if !hasParent {
+					orphanedTools++
+				}
+			}
+		}
+
+		// Clear session
+		agent.Sessions.TruncateHistory(sessionKey, 0)
+		agent.Sessions.SetSummary(sessionKey, "")
+		agent.Sessions.Save(sessionKey)
+
+		hasSummary := "no"
+		if summary != "" {
+			hasSummary = "yes"
+		}
+
+		report := fmt.Sprintf(
+			"Recovery complete.\n"+
+				"- Messages cleared: %d\n"+
+				"- Orphaned tool calls: %d\n"+
+				"- Had summary: %s\n"+
+				"- Session reset: OK",
+			msgCount, orphanedTools, hasSummary,
+		)
+		return report, true
+
+	case "/status":
+		history := agent.Sessions.GetHistory(sessionKey)
+		summary := agent.Sessions.GetSummary(sessionKey)
+		tokenEstimate := al.estimateTokens(history)
+		uptime := time.Since(al.startTime).Round(time.Second)
+
+		hasSummary := "no"
+		if summary != "" {
+			hasSummary = fmt.Sprintf("yes (%d chars)", len(summary))
+		}
+
+		status := fmt.Sprintf(
+			"Status:\n"+
+				"- Agent: %s\n"+
+				"- Model: %s\n"+
+				"- Session: %s\n"+
+				"- Messages: %d\n"+
+				"- Tokens (est): %d\n"+
+				"- Summary: %s\n"+
+				"- Uptime: %s",
+			agent.ID, agent.Model, sessionKey,
+			len(history), tokenEstimate, hasSummary,
+			uptime.String(),
+		)
+		return status, true
+
+	case "/compact":
+		history := agent.Sessions.GetHistory(sessionKey)
+		if len(history) <= 4 {
+			return fmt.Sprintf("History too short to compact (%d messages).", len(history)), true
+		}
+
+		beforeCount := len(history)
+		al.summarizeSession(agent, sessionKey)
+		afterHistory := agent.Sessions.GetHistory(sessionKey)
+		afterCount := len(afterHistory)
+
+		return fmt.Sprintf(
+			"Compaction complete.\n"+
+				"- Before: %d messages\n"+
+				"- After: %d messages\n"+
+				"- Compressed: %d messages into summary",
+			beforeCount, afterCount, beforeCount-afterCount,
+		), true
+
+	default:
+		return "", false
+	}
 }
 
 func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) (string, bool) {
