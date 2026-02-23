@@ -229,9 +229,22 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
 				logger.DebugCF("agent", "Dropping orphaned leading tool message", map[string]any{})
 				continue
 			}
-			last := sanitized[len(sanitized)-1]
-			if last.Role != "assistant" || len(last.ToolCalls) == 0 {
-				logger.DebugCF("agent", "Dropping orphaned tool message", map[string]any{})
+			// Tool results are valid after an assistant with tool calls OR after another tool result
+			// (multiple tool results follow a single assistant turn with multiple tool_use blocks)
+			hasAssistantAncestor := false
+			for i := len(sanitized) - 1; i >= 0; i-- {
+				if sanitized[i].Role == "tool" {
+					continue // skip previous tool results in same group
+				}
+				if sanitized[i].Role == "assistant" && len(sanitized[i].ToolCalls) > 0 {
+					hasAssistantAncestor = true
+				}
+				break
+			}
+			if !hasAssistantAncestor {
+				logger.DebugCF("agent", "Dropping orphaned tool message", map[string]any{
+					"tool_call_id": msg.ToolCallID,
+				})
 				continue
 			}
 			sanitized = append(sanitized, msg)
@@ -259,7 +272,52 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
 		}
 	}
 
+	// Drop incomplete tool call turns: if an assistant has tool calls but not all
+	// tool results are present, remove the entire turn to prevent API errors.
+	sanitized = dropIncompleteTurns(sanitized)
+
 	return sanitized
+}
+
+// dropIncompleteTurns removes assistant+tool groups where the number of tool results
+// doesn't match the number of tool calls in the assistant message.
+func dropIncompleteTurns(messages []providers.Message) []providers.Message {
+	result := make([]providers.Message, 0, len(messages))
+
+	i := 0
+	for i < len(messages) {
+		msg := messages[i]
+
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			expectedResults := len(msg.ToolCalls)
+
+			// Collect following tool results
+			j := i + 1
+			for j < len(messages) && messages[j].Role == "tool" {
+				j++
+			}
+			actualResults := j - i - 1
+
+			if actualResults != expectedResults {
+				logger.DebugCF("agent", "Dropping incomplete tool turn", map[string]any{
+					"expected_results": expectedResults,
+					"actual_results":   actualResults,
+				})
+				// Skip this assistant message and its tool results
+				i = j
+				continue
+			}
+
+			// Complete turn: keep assistant + all tool results
+			result = append(result, messages[i:j]...)
+			i = j
+		} else {
+			result = append(result, msg)
+			i++
+		}
+	}
+
+	return result
 }
 
 func (cb *ContextBuilder) AddToolResult(
